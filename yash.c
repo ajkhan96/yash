@@ -9,20 +9,35 @@
 #include "parse.h"
 #include "job.h"
 
-#define MAX_JOBS 100
-
 int status;
-pid_t pid_ch1, pid_ch2, pid;
+pid_t pid_ch1, pid_ch2, pid, foreground_pid;
 char lineBuffer[MAX_LINE_LENGTH];
 int inFile, outFile, errFile;
 int pipefd[2];
 job* jobTable = NULL;
+sigset_t signal_set;
 
 static void sig_int(int signo){
-    kill(-pid_ch1, SIGINT);
+    if(!backgrounded){
+        kill(-foreground_pid, SIGINT);
+    }
 }
 static void sig_tstp(int signo){
-    kill(-pid_ch1, SIGTSTP);
+    if(!backgrounded){
+        kill(-foreground_pid, SIGTSTP);
+    }
+}
+static void sig_chld(int signo){
+    pid = waitpid(-1, &status, WNOHANG);
+    while(pid > 0){
+        if(getpgid(pid) > 0){
+            job* j = jobForPGID(getpgid(pid), jobTable);
+            if(getpgid(pid) == foreground_pid) foreground_pid = -1;
+            else printf("\n[%d] - Done     %s", j->jobNum, j->line);    
+            jobTable = removeJob(j, jobTable);    
+        }
+        pid = waitpid(-1, &status, WNOHANG);
+    }
 }
 
 inline void executeCommands(){
@@ -32,11 +47,6 @@ inline void executeCommands(){
     {
         //child 1
         setpgid(getpid(), getpid());
-        job* j = (job*)malloc(sizeof(job));
-        j->line = lineBuffer;
-        j->pgid = getpid();
-        j->nextJob = NULL;
-        jobTable = addJob(j, jobTable);
         if(firstCommandInputToken){
             if((inFile = open(firstCommandInputToken, O_RDONLY)) < 0) fprintf(stderr, "Could not find file %s\n", firstCommandInputToken);
             else if(dup2(inFile, STDIN_FILENO) != STDIN_FILENO) fprintf(stderr, "Dup 2 for stdin failed\n");
@@ -61,6 +71,13 @@ inline void executeCommands(){
     else if (pid_ch1 > 0)
     {
         //parent
+        job* j = (job*)malloc(sizeof(job));
+        j->line = strdup(lineBuffer);
+        j->pgid = pid_ch1;
+        j->status = RUNNING;
+        j->nextJob = NULL;
+        jobTable = addJob(j, jobTable);
+   
         if(piped){
             pid_ch2 = fork();
             if(pid_ch2 == 0){
@@ -85,7 +102,16 @@ inline void executeCommands(){
                 close(pipefd[1]);        
             }
         }
-        if(!backgrounded) pid = waitpid(-1, &status, WUNTRACED); //do until fg process stopped or signalled
+        
+        if(!backgrounded){
+            foreground_pid = pid_ch1;
+            do{
+                pid = waitpid(-1, &status, WUNTRACED); //do until fg process stopped or signalled
+                if(WIFSTOPPED(status)){
+                    jobForPGID(pid, jobTable)->status = STOPPED;
+                }
+            }while(status);
+        }
     }
 }
 
@@ -94,23 +120,43 @@ int main(void){
         printf("signal(SIGINT) error");
     if (signal(SIGTSTP, sig_tstp) == SIG_ERR)
         printf("signal(SIGTSTP) error");
-
+    if (signal(SIGCHLD, sig_chld) == SIG_ERR){
+       printf("signal(SIGCHLD) error");
+    }
+    sigemptyset(&signal_set);    
+    sigaddset(&signal_set, SIGCHLD);
+    
     while (1){
-        
         printf("# ");
         if(!fgets(lineBuffer, MAX_LINE_LENGTH, stdin)) break;
-        parseInput(lineBuffer);
-        if((firstCommand[0] != NULL) && !strcmp(firstCommand[0], "fg")){
-
-        }else if((firstCommand[0] != NULL) && !strcmp(firstCommand[0], "bg")){
-
-        }else if((firstCommand[0] != NULL) && !strcmp(firstCommand[0], "jobs")){
+        //removeTerminatedProcesses();//Check for terminated processes and remove from jobs list
+        parseInput(strdup(lineBuffer));
+        if(!firstCommand[0]){
+        }else if(!strcmp(firstCommand[0], "bg")){
+            job* j = mostRecentJob(jobTable);
+            j->status = RUNNING;
+            kill(-(j->pgid), SIGCONT);
+        }else if(!strcmp(firstCommand[0], "fg")){
+            job* j = mostRecentJob(jobTable);
+            j->status = RUNNING;
+            kill(-(j->pgid), SIGCONT);
+            foreground_pid = pid_ch1;
+            sigprocmask(SIG_BLOCK, &signal_set, NULL);
+            pid = waitpid(-1, &status, WUNTRACED); //do until fg process stopped or signalled
+            sigprocmask(SIG_UNBLOCK, &signal_set, NULL);
+            if(WIFSTOPPED(status)){
+                j->status = STOPPED;
+            }
+        }else if(!strcmp(firstCommand[0], "jobs")){
             job* j = jobTable;
             while(j != NULL){
-                printf("[%d] %c   %s", j->jobNum, '-', j->line);
+                printf("[%d] %c %s     %s", j->jobNum, j->nextJob ? '-' : '+', j->status == RUNNING ? "Running" : "Stopped", j->line);
+                j = j->nextJob;
             }
         }else{
+            sigprocmask(SIG_BLOCK, &signal_set, NULL);
             executeCommands();       
+            sigprocmask(SIG_UNBLOCK, &signal_set, NULL);
         }
     }
 }
