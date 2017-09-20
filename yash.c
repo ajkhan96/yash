@@ -33,8 +33,10 @@ static void sig_chld(int signo){
         if(getpgid(pid) > 0){
             job* j = jobForPGID(getpgid(pid), jobTable);
             if(getpgid(pid) == foreground_pid) foreground_pid = -1;
-            else printf("\n[%d] - Done     %s", j->jobNum, j->line);    
-            jobTable = removeJob(j, jobTable);    
+            else if (j) {
+                printf("\n[%d] - Done     %s", j->jobNum, j->line);    
+                jobTable = removeJob(j, jobTable);
+            }    
         }
         pid = waitpid(-1, &status, WNOHANG);
     }
@@ -48,17 +50,17 @@ inline void executeCommands(){
         //child 1
         setpgid(getpid(), getpid());
         if(firstCommandInputToken){
-            if((inFile = open(firstCommandInputToken, O_RDONLY)) < 0) fprintf(stderr, "Could not find file %s\n", firstCommandInputToken);
+            if((inFile = open(firstCommandInputToken, O_RDONLY)) < 0){ fprintf(stderr, "Could not find file %s\n", firstCommandInputToken); return;}
             else if(dup2(inFile, STDIN_FILENO) != STDIN_FILENO) fprintf(stderr, "Dup 2 for stdin failed\n");
             close(inFile);
         }
         if(firstCommandOutputToken){
-            if((outFile = open(firstCommandOutputToken, O_WRONLY | O_APPEND | O_CREAT, S_IWUSR)) < 0) fprintf(stderr, "Could not create file %s\n", firstCommandOutputToken);
+            if((outFile = open(firstCommandOutputToken, O_WRONLY | O_APPEND | O_CREAT, S_IWUSR)) < 0){ fprintf(stderr, "Could not create file %s\n", firstCommandOutputToken); return;}
             else if(dup2(outFile, STDOUT_FILENO) != STDOUT_FILENO) fprintf(stderr, "Dup 2 for stdout failed\n");
             close(outFile);
         }
         if(firstCommandErrorToken){
-            if((errFile = open(firstCommandErrorToken, O_WRONLY | O_APPEND | O_CREAT, S_IWUSR)) < 0) fprintf(stderr, "Could not create file %s\n", firstCommandErrorToken);
+            if((errFile = open(firstCommandErrorToken, O_WRONLY | O_APPEND | O_CREAT, S_IWUSR)) < 0){ fprintf(stderr, "Could not create file %s\n", firstCommandErrorToken); return;}
             else if(dup2(errFile, STDERR_FILENO) != STDERR_FILENO) fprintf(stderr, "Dup 2 for stderr failed\n");
             close(errFile);
         }
@@ -77,7 +79,17 @@ inline void executeCommands(){
         j->status = RUNNING;
         j->nextJob = NULL;
         jobTable = addJob(j, jobTable);
-   
+
+        if(!backgrounded){
+            foreground_pid = pid_ch1;
+            do{
+                pid = waitpid(-1, &status, WUNTRACED); //do until fg process stopped or signalled
+                if(WIFSTOPPED(status)){
+                    jobForPGID(pid, jobTable)->status = STOPPED;
+                }
+            }while(status);
+        }
+
         if(piped){
             pid_ch2 = fork();
             if(pid_ch2 == 0){
@@ -100,17 +112,16 @@ inline void executeCommands(){
             }else{
                 close(pipefd[0]);
                 close(pipefd[1]);        
-            }
-        }
-        
-        if(!backgrounded){
-            foreground_pid = pid_ch1;
-            do{
-                pid = waitpid(-1, &status, WUNTRACED); //do until fg process stopped or signalled
-                if(WIFSTOPPED(status)){
-                    jobForPGID(pid, jobTable)->status = STOPPED;
+                if(!backgrounded){
+                    foreground_pid = pid_ch2;
+                    do{
+                        pid = waitpid(-1, &status, WUNTRACED); //do until fg process stopped or signalled
+                        if(WIFSTOPPED(status)){
+                            jobForPGID(pid, jobTable)->status = STOPPED;
+                        }
+                    }while(status);
                 }
-            }while(status);
+            }
         }
     }
 }
@@ -120,16 +131,15 @@ int main(void){
         printf("signal(SIGINT) error");
     if (signal(SIGTSTP, sig_tstp) == SIG_ERR)
         printf("signal(SIGTSTP) error");
-    if (signal(SIGCHLD, sig_chld) == SIG_ERR){
-       printf("signal(SIGCHLD) error");
-    }
+    // if (signal(SIGCHLD, sig_chld) == SIG_ERR){
+    //    printf("signal(SIGCHLD) error");
+    // }
     sigemptyset(&signal_set);    
     sigaddset(&signal_set, SIGCHLD);
     
     while (1){
         printf("# ");
         if(!fgets(lineBuffer, MAX_LINE_LENGTH, stdin)) break;
-        //removeTerminatedProcesses();//Check for terminated processes and remove from jobs list
         parseInput(strdup(lineBuffer));
         if(!firstCommand[0]){
         }else if(!strcmp(firstCommand[0], "bg")){
@@ -140,13 +150,13 @@ int main(void){
             job* j = mostRecentJob(jobTable);
             j->status = RUNNING;
             kill(-(j->pgid), SIGCONT);
-            foreground_pid = pid_ch1;
+            foreground_pid = j->pgid;
             sigprocmask(SIG_BLOCK, &signal_set, NULL);
             pid = waitpid(-1, &status, WUNTRACED); //do until fg process stopped or signalled
-            sigprocmask(SIG_UNBLOCK, &signal_set, NULL);
             if(WIFSTOPPED(status)){
                 j->status = STOPPED;
             }
+            sigprocmask(SIG_UNBLOCK, &signal_set, NULL);
         }else if(!strcmp(firstCommand[0], "jobs")){
             job* j = jobTable;
             while(j != NULL){
